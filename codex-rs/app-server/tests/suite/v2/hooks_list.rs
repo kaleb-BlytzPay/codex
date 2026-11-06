@@ -738,7 +738,11 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks(
                     enabled: None,
                     trusted_hash: Some(declaration_hash),
                     trusted_content_hash: Some(
-                        hook.current_hash.split_once('/').unwrap().1.to_string()
+                        hook.current_hash
+                            .split_once('/')
+                            .expect("plugin approval hash should include a content hash")
+                            .1
+                            .to_string(),
                     ),
                 },
             );

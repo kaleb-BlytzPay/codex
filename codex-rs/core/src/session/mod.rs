@@ -6087,8 +6087,9 @@ async fn reload_user_layers(config: &Config) -> std::io::Result<codex_config::Co
 
 async fn hook_config_from_user_layers(config: &Config) -> std::io::Result<Config> {
     let layers = reload_user_layers(config).await?;
-    // Validate each layer before merging: a malformed override must not uncover grants
-    // in a lower layer, or leave a stale plugin policy in the materialized Config.
+    // Malformed hooks or plugins toml fails closed. Plugin enablement stays on the
+    // session config: a saved user layer must not restore a plugin the session denied.
+    // Per-plugin disk disables still ride along on the reloaded stack.
     for layer in layers.all_layers_low_to_high() {
         if let Some(hooks) = layer.config.get("hooks") {
             hooks
@@ -6105,13 +6106,24 @@ async fn hook_config_from_user_layers(config: &Config) -> std::io::Result<Config
     }
     let mut refreshed = config.clone();
     let effective = layers.effective_config();
-    refreshed.plugins = effective
-        .get("plugins")
-        .cloned()
-        .map(toml::Value::try_into)
-        .transpose()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
-        .unwrap_or_default();
+    // A persisted default deny applies only when this session has not published one.
+    // An in-memory deny must survive a disk user layer that still allows the plugin.
+    if refreshed.plugins.default.is_none() {
+        let disk_plugins: codex_config::types::PluginsConfigToml = effective
+            .get("plugins")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+            .unwrap_or_default();
+        if disk_plugins
+            .default
+            .as_ref()
+            .is_some_and(|default| !default.enabled)
+        {
+            refreshed.plugins.default = disk_plugins.default;
+        }
+    }
     if let Some(enabled) = effective
         .get("features")
         .and_then(|features| features.get("plugins"))

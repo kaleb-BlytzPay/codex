@@ -21,6 +21,7 @@ pub use declarations::PluginHookDeclaration;
 pub use declarations::plugin_hook_declarations;
 pub use engine::HookListEntry;
 pub use engine::HookListEntryHandler;
+pub use engine::command_runner::MAX_CONCURRENT_ASYNC_HOOKS;
 pub use engine::discovery::validate_environment_hooks;
 pub use engine::dispatcher::hook_execution_mode_label;
 pub use engine::dispatcher::hook_handler_type_label;

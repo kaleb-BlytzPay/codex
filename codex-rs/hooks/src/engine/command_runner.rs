@@ -51,7 +51,8 @@ use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 
-const MAX_CONCURRENT_ASYNC_HOOKS: usize = 8;
+/// Background command and MCP hooks share these permits. Session bookkeeping must not take one.
+pub const MAX_CONCURRENT_ASYNC_HOOKS: usize = 8;
 
 /// Owns command execution and bounded asynchronous work for one session.
 #[derive(Clone)]
@@ -172,12 +173,26 @@ impl CommandHookRuntime {
     }
 
     pub(crate) fn schedule_async_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.spawn_tracked(task, /*bounded*/ true);
+    }
+
+    /// Track session bookkeeping until shutdown. This does not take an async-hook permit.
+    pub(crate) fn schedule_session_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.spawn_tracked(task, /*bounded*/ false);
+    }
+
+    fn spawn_tracked(&self, task: impl Future<Output = ()> + Send + 'static, bounded: bool) {
         let mut state = self.lock_state();
         if state.concurrency_limit.is_closed() {
             return;
         }
 
         while state.tasks.try_join_next().is_some() {}
+        if !bounded {
+            state.tasks.spawn(task);
+            return;
+        }
+
         let concurrency_limit = Arc::clone(&state.concurrency_limit);
         state.tasks.spawn(async move {
             let Ok(_permit) = concurrency_limit.acquire_owned().await else {

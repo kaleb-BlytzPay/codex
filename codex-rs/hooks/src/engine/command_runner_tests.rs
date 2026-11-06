@@ -21,6 +21,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tempfile::tempdir;
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
@@ -679,6 +680,83 @@ print("{{}}")
     assert_eq!(started_count(), MAX_CONCURRENT_ASYNC_HOOKS + 1);
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_task_runs_while_async_hook_capacity_is_saturated() {
+    let temp = TempDir::new().expect("async test directory");
+    let (runtime, _results) = runtime();
+    let started_dir = temp.path().join("started");
+    let release_path = temp.path().join("release");
+    std::fs::create_dir(&started_dir).expect("create hook marker directory");
+    let mut handler = write_handler(
+        &temp,
+        &format!(
+            r#"import os
+from pathlib import Path
+import sys
+import time
+
+sys.stdin.read()
+Path(r"{started}", str(os.getpid())).touch()
+while not Path(r"{release}").exists():
+    time.sleep(0.01)
+print("{{}}")
+"#,
+            started = started_dir.display(),
+            release = release_path.display(),
+        ),
+    );
+    handler.timeout_sec = ASYNC_HOOK_TEST_TIMEOUT.as_secs();
+
+    for _ in 0..MAX_CONCURRENT_ASYNC_HOOKS {
+        schedule(&runtime, handler.clone(), temp.path()).await;
+    }
+
+    let started_count = || {
+        std::fs::read_dir(&started_dir)
+            .expect("read hook marker directory")
+            .count()
+    };
+    timeout(ASYNC_HOOK_TEST_TIMEOUT, async {
+        while started_count() < MAX_CONCURRENT_ASYNC_HOOKS {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("async hooks should fill every permit");
+    assert_eq!(started_count(), MAX_CONCURRENT_ASYNC_HOOKS);
+
+    schedule(&runtime, handler, temp.path()).await;
+    let (started_tx, started_rx) = oneshot::channel();
+    let (hold_tx, hold_rx) = oneshot::channel::<()>();
+    let (finished_tx, finished_rx) = oneshot::channel();
+    runtime.schedule_session_task(async move {
+        let _ = started_tx.send(());
+        let _ = hold_rx.await;
+        let _ = finished_tx.send(());
+    });
+
+    timeout(ASYNC_HOOK_TEST_TIMEOUT, started_rx)
+        .await
+        .expect("session bookkeeping should run without an async-hook permit")
+        .expect("session task should signal before shutdown");
+    assert!(
+        !release_path.exists(),
+        "saturated hooks must still be waiting when session bookkeeping runs"
+    );
+    assert_eq!(started_count(), MAX_CONCURRENT_ASYNC_HOOKS);
+
+    runtime.shutdown().await;
+    assert!(
+        timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .expect("shutdown should abort session bookkeeping")
+            .is_err(),
+        "shutdown must not let session bookkeeping finish"
+    );
+    drop(hold_tx);
+    std::fs::write(&release_path, "ready").expect("release saturated hooks");
 }
 
 #[tokio::test]

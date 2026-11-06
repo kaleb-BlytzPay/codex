@@ -2942,11 +2942,13 @@ async fn try_run_sampling_request(
     let defer_tool_dispatch = post_mode == Some(HookExecutionMode::Sync);
     // Always admit the post hook at completion, even when no handler was approved at
     // request start. Tool calls already dispatched retain their admission snapshot.
+    // This wait is session bookkeeping: it must not take an async-hook permit, or a
+    // saturated background queue stalls hook-free completion for the whole response.
     let finish_post_request = Some({
         let (post_request, completed) = tokio::sync::oneshot::channel();
         let (admitted, wait_for_admission) = tokio::sync::oneshot::channel();
         let (hook_done, wait_for_hook) = tokio::sync::oneshot::channel();
-        hooks.schedule_async_task({
+        hooks.schedule_session_task({
             let session = Arc::clone(&sess);
             let step = Arc::clone(&step_context);
             async move {

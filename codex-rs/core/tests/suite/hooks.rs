@@ -72,6 +72,7 @@ use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_with_timeout;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -6233,7 +6234,8 @@ async fn model_request_post_hook_refreshes_at_delayed_dispatch(approve: bool) ->
     .await;
     let test = test_codex()
         .with_pre_build_hook(|home| {
-            write_lifecycle_hooks(home, &["PreModelRequest", "PostModelRequest"]).unwrap();
+            write_lifecycle_hooks(home, &["PreModelRequest", "PostModelRequest"])
+                .expect("write lifecycle hooks");
         })
         .with_config(trust_discovered_hooks)
         .build_with_streaming_server(&server)
@@ -6244,7 +6246,7 @@ async fn model_request_post_hook_refreshes_at_delayed_dispatch(approve: bool) ->
     let mut revoked: toml::Value = toml::from_str(&approved)?;
     revoked["hooks"]["state"]
         .as_table_mut()
-        .unwrap()
+        .expect("hook state should be a table")
         .retain(|key, _| !key.contains(":post_model_request:"));
     let revoked = toml::to_string(&revoked)?;
     if approve {
@@ -6272,6 +6274,123 @@ async fn model_request_post_hook_refreshes_at_delayed_dispatch(approve: bool) ->
         assert_eq!(post[0]["status"], "completed");
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn hook_free_model_request_completes_while_async_hooks_saturate_capacity() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (finish, gate) = oneshot::channel();
+    let (server, _) = start_streaming_sse_server(vec![vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("saturated")]),
+        },
+        StreamingSseChunk {
+            gate: Some(gate),
+            body: sse_event(ev_completed("saturated")),
+        },
+    ]])
+    .await;
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_saturating_async_prompt_hooks(home).expect("write saturating async hooks");
+        })
+        .with_config(trust_discovered_hooks)
+        .build_with_streaming_server(&server)
+        .await?;
+    let home = test.codex_home_path();
+    let release = home.join("async-hook-release");
+    let started = home.join("async-hook-started");
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "respond".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if async_hook_marker_count(&started) >= codex_hooks::MAX_CONCURRENT_ASYNC_HOOKS {
+                return Ok::<(), anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        async_hook_marker_count(&started),
+        codex_hooks::MAX_CONCURRENT_ASYNC_HOOKS,
+        "one async hook must stay queued behind the permit limit"
+    );
+    assert!(
+        !release.exists(),
+        "async hooks must still hold every permit"
+    );
+    finish
+        .send(())
+        .expect("release the hook-free model response");
+    let event = wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        matches!(&event, EventMsg::TurnComplete(completed) if completed.error.is_none()),
+        "hook-free completion should not wait for saturated async hooks: {event:?}"
+    );
+    assert_eq!(
+        async_hook_marker_count(&started),
+        codex_hooks::MAX_CONCURRENT_ASYNC_HOOKS,
+        "completion must leave the queued async hook blocked"
+    );
+    assert!(!release.exists());
+    fs::write(&release, "ready")?;
+    Ok(())
+}
+
+fn write_saturating_async_prompt_hooks(home: &Path) -> Result<()> {
+    let started = home.join("async-hook-started");
+    fs::create_dir(&started)?;
+    let release = home.join("async-hook-release");
+    let script = home.join("async_hook_hold.py");
+    fs::write(
+        &script,
+        r#"import sys
+from pathlib import Path
+import time
+
+sys.stdin.read()
+Path(sys.argv[1]).write_text("started", encoding="utf-8")
+release = Path(sys.argv[2])
+while not release.exists():
+    time.sleep(0.01)
+"#,
+    )?;
+    let handlers = (0..=codex_hooks::MAX_CONCURRENT_ASYNC_HOOKS)
+        .map(|index| {
+            json!({
+                "type": "command",
+                "command": format!(
+                    "python3 '{}' '{}' '{}'",
+                    script.display(),
+                    started.join(index.to_string()).display(),
+                    release.display(),
+                ),
+                "async": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        home.join("hooks.json"),
+        json!({"hooks": {"UserPromptSubmit": [{"hooks": handlers}]}}).to_string(),
+    )?;
+    Ok(())
+}
+
+fn async_hook_marker_count(started: &Path) -> usize {
+    fs::read_dir(started)
+        .map(|entries| entries.filter_map(std::result::Result::ok).count())
+        .unwrap_or(0)
 }
 
 #[test_case::test_case(Some(false), false; "sync finishes before dispatch")]
