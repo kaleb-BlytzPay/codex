@@ -28,7 +28,6 @@ use crate::config::RuntimeConfigRefresh;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
 use crate::context::TurnAborted;
-use crate::environment_selection::EnvironmentAttachment;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
@@ -1954,8 +1953,8 @@ async fn reload_user_config_layer_updates_base_and_selected_profile_layers() {
     );
 }
 
-#[tokio::test]
-async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
+async fn hook_refresh_test_session()
+-> anyhow::Result<(Arc<Session>, codex_hooks::SessionStartRequest, toml::Value)> {
     let session = make_session_with_config(|config| {
         config
             .features
@@ -2023,9 +2022,243 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
     }))?;
     std::fs::write(&config_toml_path, toml::to_string(&trusted_user_config)?)?;
 
-    session.reload_user_config_layer().await;
+    Ok((session, request, trusted_user_config))
+}
 
+#[test_case(false; "full reload")]
+#[test_case(true; "hook admission only")]
+#[tokio::test]
+async fn reload_user_config_layer_refreshes_hooks(hooks_only: bool) -> anyhow::Result<()> {
+    let (session, request, _) = hook_refresh_test_session().await?;
+    let config = session.get_config().await;
+    if hooks_only {
+        session.refresh_hook_admission().await;
+        assert!(Arc::ptr_eq(&config, &session.get_config().await));
+    } else {
+        session.reload_user_config_layer().await;
+    }
     assert_eq!(session.hooks().preview_session_start(&request).len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hook_admission_refresh_preserves_profile_and_session_precedence() -> anyhow::Result<()> {
+    let (session, request, approved) = hook_refresh_test_session().await?;
+    let mut config = (*session.get_config().await).clone();
+    let base = config.codex_home.join(CONFIG_TOML_FILE);
+    let profile = config.codex_home.join("work.config.toml");
+    let key = approved["hooks"]["state"]
+        .as_table()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+    let deny: toml::Value = serde_json::from_value(serde_json::json!({
+        "hooks": {"state": {key: {"enabled": false}}},
+    }))?;
+    std::fs::write(&profile, toml::to_string(&deny)?)?;
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(&base, approved.clone())?
+        .with_user_config_profile(&profile, Some(&"work".parse()?), deny.clone())?;
+    let config = Arc::new(config);
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::clone(&config);
+    session.refresh_hook_admission().await;
+    assert!(session.hooks().preview_session_start(&request).is_empty());
+
+    // Removing the selected profile restores an explicitly approved base hook.
+    std::fs::remove_file(&profile)?;
+    session.refresh_hook_admission().await;
+    assert_eq!(session.hooks().preview_session_start(&request).len(), 1);
+    assert!(Arc::ptr_eq(&config, &session.get_config().await));
+
+    let mut session_denied = (*config).clone();
+    session_denied.config_layer_stack = session_denied
+        .config_layer_stack
+        .with_session_config(deny)?;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(session_denied);
+    session.refresh_hook_admission().await;
+    assert!(session.hooks().preview_session_start(&request).is_empty());
+    Ok(())
+}
+
+#[test_case("revoke"; "revoked grant")]
+#[test_case("disable"; "disabled hook")]
+#[test_case("delete"; "missing layer")]
+#[test_case("malformed"; "malformed TOML")]
+#[test_case("invalid_state"; "malformed hook state")]
+#[test_case("unreadable"; "unreadable layer")]
+#[test_case("managed_only"; "managed only policy")]
+#[tokio::test]
+async fn hook_admission_refresh_fails_closed_without_removing_managed_hooks(
+    denial: &str,
+) -> anyhow::Result<()> {
+    let (session, request, approved) = hook_refresh_test_session().await?;
+    let mut config = (*session.get_config().await).clone();
+    let path = config.codex_home.join(CONFIG_TOML_FILE);
+    // A required managed hook survives both a user-layer error and managed-only policy.
+    let managed: codex_config::ManagedHooksRequirementsToml =
+        serde_json::from_value(serde_json::json!({"SessionStart": [{"hooks": [{
+            "type": "command", "command": "echo required-managed",
+        }]}]}))?;
+    let mut requirements = config.config_layer_stack.requirements().clone();
+    requirements.managed_hooks = Some(codex_config::ConstrainedWithSource::new(
+        codex_config::Constrained::allow_any(managed),
+        Some(codex_config::RequirementSource::Unknown),
+    ));
+    config.config_layer_stack = codex_config::ConfigLayerStack::new(
+        config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect(),
+        requirements,
+        config.config_layer_stack.requirements_toml().clone(),
+    )?
+    .with_user_config(&path, approved.clone())?;
+    let config = Arc::new(config);
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::clone(&config);
+    session.refresh_hook_admission().await;
+    assert_eq!(session.hooks().preview_session_start(&request).len(), 2);
+    let mut changed = approved.clone();
+    let key = approved["hooks"]["state"]
+        .as_table()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+    match denial {
+        "delete" => std::fs::remove_file(&path)?,
+        "unreadable" => {
+            std::fs::remove_file(&path)?;
+            std::fs::create_dir(&path)?;
+        }
+        "malformed" => std::fs::write(&path, "[hooks.state")?,
+        "managed_only" => {
+            let mut next = (*config).clone();
+            next.config_layer_stack = super::managed_only_hook_config(&next).config_layer_stack;
+            session
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .original_config_do_not_use = Arc::new(next);
+        }
+        _ => {
+            if denial == "revoke" {
+                changed["hooks"]["state"] = toml::Value::Table(Default::default());
+            } else {
+                changed["hooks"]["state"][key]
+                    .as_table_mut()
+                    .unwrap()
+                    .insert(
+                        "enabled".to_string(),
+                        if denial == "disable" {
+                            toml::Value::Boolean(false)
+                        } else {
+                            toml::Value::String("invalid".to_string())
+                        },
+                    );
+            }
+            std::fs::write(&path, toml::to_string(&changed)?)?;
+        }
+    }
+    session.refresh_hook_admission().await;
+    let remaining = session.hooks().preview_session_start(&request);
+    assert_eq!(remaining.len(), 1, "{denial}");
+    assert_eq!(
+        remaining[0].source,
+        codex_protocol::protocol::HookSource::Unknown
+    );
+    if denial != "managed_only" {
+        assert!(Arc::ptr_eq(&config, &session.get_config().await));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_case("owner"; "config owner replaced")]
+#[test_case("selection"; "disabled plugin selection replaced")]
+#[test_case("concurrent"; "same owner refreshes serialized")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_admission_refresh_retries_stale_reads(change: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let (session, request, approved) = hook_refresh_test_session().await?;
+    let config = session.get_config().await;
+    let path = config.codex_home.join(CONFIG_TOML_FILE);
+    std::fs::remove_file(&path)?;
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(path.as_path())
+            .status()?
+            .success()
+    );
+    let refresh = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move { session.refresh_hook_admission().await }
+    });
+    // Opening the writer completes only once the refresh has captured its owner and
+    // started reading. The session lock must remain available throughout that read.
+    let mut writer = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || std::fs::OpenOptions::new().write(true).open(path)
+        }),
+    )
+    .await???;
+    {
+        let mut state = tokio::time::timeout(Duration::from_secs(10), session.state.lock()).await?;
+        if change == "selection" {
+            state.active_disabled_plugin_ids = vec!["changed@test".to_string()];
+        } else if change == "owner" {
+            state.session_configuration.original_config_do_not_use = Arc::new((*config).clone());
+        }
+    }
+    // The in-flight read sees an old approval; the retry must see its removal.
+    std::fs::remove_file(&path)?;
+    std::fs::write(&path, "")?;
+    let mut concurrent = (change == "concurrent").then(|| {
+        tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.refresh_hook_admission().await }
+        })
+    });
+    let overlapped = if let Some(task) = concurrent.as_mut() {
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+    writer.write_all(toml::to_string(&approved)?.as_bytes())?;
+    drop(writer);
+    tokio::time::timeout(Duration::from_secs(10), refresh).await??;
+    if let Some(task) = concurrent
+        && !overlapped
+    {
+        tokio::time::timeout(Duration::from_secs(10), task).await??;
+    }
+    assert!(
+        !overlapped,
+        "a newer disk read must not publish before an older refresh finishes"
+    );
+    assert!(session.hooks().preview_session_start(&request).is_empty());
     Ok(())
 }
 

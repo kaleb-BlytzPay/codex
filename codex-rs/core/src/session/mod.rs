@@ -2481,26 +2481,44 @@ impl Session {
         state.session_configuration.provider.info().clone()
     }
 
+    /// Serializes all hook publications, including process-local configuration reloads.
     pub(crate) async fn refresh_hooks(&self, mut config: Arc<Config>) {
+        let refresh = self
+            .services
+            .thread_extension_data
+            .get_or_init(HookRefresh::default);
+        // This private semaphore is never closed.
+        let _permit = refresh.0.acquire().await;
         loop {
             let disabled_plugin_ids = self.state.lock().await.active_disabled_plugin_ids.clone();
             let environments = self.services.turn_environments.snapshot().await;
+            // Only this hook projection sees fresh user files. Turn settings remain pinned.
+            let hook_config = match hook_config_from_user_layers(&config).await {
+                Ok(config) => config,
+                Err(err) => {
+                    warn!(
+                        "failed to refresh hook configuration; admitting managed hooks only: {err}"
+                    );
+                    managed_only_hook_config(&config)
+                }
+            };
             let hooks_config = build_hooks_config(
-                config.as_ref(),
+                &hook_config,
                 self.services.plugins_manager.as_ref(),
                 environments.single_local_environment(),
                 &disabled_plugin_ids,
             )
             .await;
 
+            // Discovery also reads declaration files. Finish it before taking the session lock.
+            let hooks = Arc::new(self.hooks().reconfigured(hooks_config));
             let state = self.state.lock().await;
             if Arc::ptr_eq(
                 &state.session_configuration.original_config_do_not_use,
                 &config,
             ) && state.active_disabled_plugin_ids == disabled_plugin_ids
             {
-                let hooks = self.hooks().reconfigured(hooks_config);
-                self.services.hooks.store(Arc::new(hooks));
+                self.services.hooks.store(hooks);
                 return;
             }
             // Unrelated updates can replace the owner too. Rebuild current inputs
@@ -2539,79 +2557,15 @@ impl Session {
         // config snapshot. This file-based path exists for legacy local reload flows.
         // Retry from the current owner if another publication wins while files are read.
         loop {
-            let (expected_config, config_toml_paths) = {
-                let state = self.state.lock().await;
-                let config = Arc::clone(&state.session_configuration.original_config_do_not_use);
-                let user_config_paths = config
-                    .config_layer_stack
-                    .all_layers_low_to_high()
-                    .filter_map(|layer| match &layer.name {
-                        ConfigLayerSource::User { file, .. } => Some(file.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                let paths = if user_config_paths.is_empty() {
-                    vec![
-                        state
-                            .session_configuration
-                            .codex_home
-                            .join(CONFIG_TOML_FILE),
-                    ]
-                } else {
-                    user_config_paths
-                };
-                (config, paths)
-            };
-
-            let mut reloaded_user_configs = Vec::with_capacity(config_toml_paths.len());
-            for config_toml_path in config_toml_paths {
-                let user_config = match std::fs::read_to_string(&config_toml_path) {
-                    Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
-                        Ok(config) => config,
-                        Err(err) => {
-                            warn!("failed to parse user config while reloading layer: {err}");
-                            return;
-                        }
-                    },
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        toml::Value::Table(Default::default())
-                    }
-                    Err(err) => {
-                        warn!("failed to read user config while reloading layer: {err}");
-                        return;
-                    }
-                };
-                let Some(config_dir) = config_toml_path.parent() else {
-                    warn!("user config path has no parent directory");
-                    return;
-                };
-                let user_config = match codex_config::loader::resolve_relative_paths_in_config_toml(
-                    user_config,
-                    &config_dir,
-                ) {
-                    Ok(config) => config,
-                    Err(err) => {
-                        warn!("failed to resolve paths while reloading user config: {err}");
-                        return;
-                    }
-                };
-                reloaded_user_configs.push((config_toml_path, user_config));
-            }
-
+            let expected_config = self.get_config().await;
             let mut next_config = expected_config.as_ref().clone();
-            for (config_toml_path, user_config) in reloaded_user_configs {
-                let config_layer_stack = match next_config
-                    .config_layer_stack
-                    .with_user_config(&config_toml_path, user_config)
-                {
-                    Ok(config_layer_stack) => config_layer_stack,
-                    Err(err) => {
-                        warn!("failed to validate user config while reloading layer: {err}");
-                        return;
-                    }
-                };
-                next_config.config_layer_stack = config_layer_stack;
-            }
+            next_config.config_layer_stack = match reload_user_layers(&expected_config).await {
+                Ok(layers) => layers,
+                Err(err) => {
+                    warn!("failed to reload user configuration: {err}");
+                    return;
+                }
+            };
             match self
                 .refresh_config(
                     expected_config,
@@ -5965,6 +5919,11 @@ impl Session {
         }
     }
 
+    /// Refresh before selecting or previewing handlers, including an empty runtime.
+    pub(crate) async fn refresh_hook_admission(&self) {
+        self.refresh_hooks(self.get_config().await).await;
+    }
+
     pub(crate) fn hooks(&self) -> Arc<Hooks> {
         self.services.hooks.load_full()
     }
@@ -6085,6 +6044,119 @@ pub(crate) fn emit_subagent_session_started(
     analytics_events_client.track_subagent_thread_started(input);
 }
 
+/// Separate from the session lock: file reads and plugin discovery can await other tasks.
+struct HookRefresh(tokio::sync::Semaphore);
+
+impl Default for HookRefresh {
+    fn default() -> Self {
+        Self(tokio::sync::Semaphore::new(1))
+    }
+}
+
+/// Shared by the explicit runtime reload and the hook-only admission projection.
+async fn reload_user_layers(config: &Config) -> std::io::Result<codex_config::ConfigLayerStack> {
+    let mut paths = config
+        .config_layer_stack
+        .all_layers_low_to_high()
+        .filter_map(|layer| match &layer.name {
+            ConfigLayerSource::User { file, .. } => Some(file.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        paths.push(config.codex_home.join(CONFIG_TOML_FILE));
+    }
+    let mut layers = config.config_layer_stack.clone();
+    for path in paths {
+        let value = match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => toml::from_str::<toml::Value>(&contents)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                toml::Value::Table(Default::default())
+            }
+            Err(err) => return Err(err),
+        };
+        let directory = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("user config has no parent"))?;
+        let value = codex_config::loader::resolve_relative_paths_in_config_toml(value, &directory)?;
+        layers = layers.with_user_config(&path, value)?;
+    }
+    Ok(layers)
+}
+
+async fn hook_config_from_user_layers(config: &Config) -> std::io::Result<Config> {
+    let layers = reload_user_layers(config).await?;
+    // Validate each layer before merging: a malformed override must not uncover grants
+    // in a lower layer, or leave a stale plugin policy in the materialized Config.
+    for layer in layers.all_layers_low_to_high() {
+        if let Some(hooks) = layer.config.get("hooks") {
+            hooks
+                .clone()
+                .try_into::<codex_config::HooksToml>()
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        }
+        if let Some(plugins) = layer.config.get("plugins") {
+            plugins
+                .clone()
+                .try_into::<codex_config::types::PluginsConfigToml>()
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        }
+    }
+    let mut refreshed = config.clone();
+    let effective = layers.effective_config();
+    refreshed.plugins = effective
+        .get("plugins")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+        .unwrap_or_default();
+    if let Some(enabled) = effective
+        .get("features")
+        .and_then(|features| features.get("plugins"))
+    {
+        let enabled = enabled.as_bool().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "features.plugins must be a boolean",
+            )
+        })?;
+        // A persisted disable takes effect immediately; a session/managed gate stays pinned.
+        if !enabled {
+            refreshed
+                .features
+                .disable(Feature::Plugins)
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    refreshed.config_layer_stack = layers;
+    Ok(refreshed)
+}
+
+fn managed_only_hook_config(config: &Config) -> Config {
+    let mut config = config.clone();
+    let stack = &config.config_layer_stack;
+    let mut requirements = stack.requirements().clone();
+    requirements.allow_managed_hooks_only = Some(codex_config::Sourced::new(
+        true,
+        codex_config::RequirementSource::Unknown,
+    ));
+    // This standalone projection is only consumed by Hooks. Keep every managed source
+    // and requirement, including required hooks; never fall back to a stale user grant.
+    let Ok(layers) = codex_config::ConfigLayerStack::new(
+        stack.all_layers_low_to_high().cloned().collect(),
+        requirements,
+        stack.requirements_toml().clone(),
+    ) else {
+        // The constructor validates layer ordering, shell policy and project/provider
+        // requirements. All are copied unchanged from an already validated stack.
+        unreachable!("managed-only hook admission cannot invalidate existing config layers");
+    };
+    config.config_layer_stack = layers;
+    config
+}
+
 /// Builds hook configuration for one config snapshot, including any enabled plugin hooks.
 async fn build_hooks_config(
     config: &Config,
@@ -6101,13 +6173,27 @@ async fn build_hooks_config(
             (Some(program), argv)
         })
         .unwrap_or_default();
-    let plugins_input = config.plugins_config_input();
-    let plugin_outcome = plugins_manager
-        .plugins_for_config(&plugins_input)
-        .await
-        .without_plugins(disabled_plugin_ids);
-    let plugin_hook_sources = plugin_outcome.effective_plugin_hook_sources();
-    let plugin_hook_load_warnings = plugin_outcome.effective_plugin_hook_warnings();
+    let (plugin_hook_sources, plugin_hook_load_warnings) = if config
+        .config_layer_stack
+        .requirements()
+        .allow_managed_hooks_only
+        .as_ref()
+        .is_some_and(|rule| rule.value)
+    {
+        (Vec::new(), Vec::new())
+    } else {
+        let plugins_input = config.plugins_config_input();
+        // The manager validates installed roots and reuses parsed plugins when its inputs
+        // are unchanged. Trust is still verified from fresh bytes on every execution.
+        let plugin_outcome = plugins_manager
+            .plugins_for_config(&plugins_input)
+            .await
+            .without_plugins(disabled_plugin_ids);
+        (
+            plugin_outcome.effective_plugin_hook_sources(),
+            plugin_outcome.effective_plugin_hook_warnings(),
+        )
+    };
     HooksConfig {
         legacy_notify_argv: config.notify.clone(),
         feature_enabled: config.features.enabled(Feature::CodexHooks),

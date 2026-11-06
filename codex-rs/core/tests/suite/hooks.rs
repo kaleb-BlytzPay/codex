@@ -6214,6 +6214,66 @@ async fn model_request_observer_reports_cancellation() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case(true; "newly approved after request start")]
+#[test_case::test_case(false; "revoked after request start")]
+#[tokio::test]
+async fn model_request_post_hook_refreshes_at_delayed_dispatch(approve: bool) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (finish, gate) = oneshot::channel();
+    let (server, _) = start_streaming_sse_server(vec![vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("delayed")]),
+        },
+        StreamingSseChunk {
+            gate: Some(gate),
+            body: sse_event(ev_completed("delayed")),
+        },
+    ]])
+    .await;
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_lifecycle_hooks(home, &["PreModelRequest", "PostModelRequest"]).unwrap();
+        })
+        .with_config(trust_discovered_hooks)
+        .build_with_streaming_server(&server)
+        .await?;
+    let home = test.codex_home_path();
+    let config_path = home.join("config.toml");
+    let approved = fs::read_to_string(&config_path)?;
+    let mut revoked: toml::Value = toml::from_str(&approved)?;
+    revoked["hooks"]["state"]
+        .as_table_mut()
+        .unwrap()
+        .retain(|key, _| !key.contains(":post_model_request:"));
+    let revoked = toml::to_string(&revoked)?;
+    if approve {
+        fs::write(&config_path, &revoked)?;
+    }
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "respond".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    // PreModelRequest runs after request-start hook selection. Hold the response while
+    // changing approval so the delayed post admission must read a different snapshot.
+    wait_for_hook_inputs(home, "PreModelRequest", 1).await?;
+    fs::write(&config_path, if approve { &approved } else { &revoked })?;
+    finish.send(()).expect("release response stream");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(home.join("PostModelRequest.jsonl").exists(), approve);
+    if approve {
+        let post = read_hook_inputs_from_log(&home.join("PostModelRequest.jsonl"))?;
+        assert_eq!(post.len(), 1);
+        assert_eq!(post[0]["status"], "completed");
+    }
+    Ok(())
+}
+
 #[test_case::test_case(Some(false), false; "sync finishes before dispatch")]
 #[test_case::test_case(Some(false), true; "resume after interrupt preserves aborted custom call and usage")]
 #[test_case::test_case(Some(true), false; "async dispatches before stream ends")]

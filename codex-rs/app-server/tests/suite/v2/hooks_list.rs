@@ -7,6 +7,7 @@ use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigEdit;
+use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookEventName;
 use codex_app_server_protocol::HookHandlerMetadata;
 use codex_app_server_protocol::HookMetadata;
@@ -20,6 +21,8 @@ use codex_app_server_protocol::PluginInstallParams;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -556,18 +559,32 @@ async fn plugin_upgrade_refreshes_hook_runtime_for_loaded_session() -> Result<()
     Ok(())
 }
 
+#[test_case::test_case(true; "previously approved")]
+#[test_case::test_case(false; "previously filtered out")]
 #[tokio::test]
-async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()> {
+async fn loaded_session_refreshes_externally_updated_plugin_hooks(
+    initially_approved: bool,
+) -> Result<()> {
     skip_if_host_windows!(Ok(()));
     skip_if_remote!(Ok(()), "command hooks use host-local script and log paths");
 
-    let server = create_mock_responses_server_sequence_unchecked(vec![
-        create_final_assistant_message_sse_response("Version 1")?,
-        create_final_assistant_message_sse_response("Version 2 needs approval")?,
-        create_final_assistant_message_sse_response("Version 2")?,
-        create_final_assistant_message_sse_response("Rollback needs approval")?,
-        create_final_assistant_message_sse_response("Rollback")?,
-    ])
+    let mut versions = vec![("1.0.0", false, HookTrustStatus::Trusted)];
+    if !initially_approved {
+        versions.insert(0, ("1.0.0", false, HookTrustStatus::Untrusted));
+    }
+    versions.extend([
+        ("1.0.0", true, HookTrustStatus::Modified),
+        ("1.0.0", true, HookTrustStatus::Trusted),
+        ("2.0.0", false, HookTrustStatus::Modified),
+        ("2.0.0", false, HookTrustStatus::Trusted),
+        ("0.9.0", false, HookTrustStatus::Modified),
+        ("0.9.0", false, HookTrustStatus::Trusted),
+    ]);
+    let server = create_mock_responses_server_sequence_unchecked(
+        (0..versions.len() + 13)
+            .map(|_| create_final_assistant_message_sse_response("done"))
+            .collect::<Result<Vec<_>>>()?,
+    )
     .await;
     let codex_home = TempDir::new()?;
     let source = TempDir::new()?;
@@ -605,20 +622,22 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()
             )
         })
         .collect::<serde_json::Map<String, serde_json::Value>>();
-    let trust_id = mcp
-        .send_config_batch_write_request(ConfigBatchWriteParams {
-            edits: vec![ConfigEdit {
-                key_path: "hooks.state".to_string(),
-                value: serde_json::Value::Object(trusted_hooks),
-                merge_strategy: MergeStrategy::Upsert,
-            }],
-            file_path: None,
-            expected_version: None,
-            reload_user_config: true,
-        })
-        .await?;
-    let _: codex_app_server_protocol::ConfigWriteResponse =
-        timeout(DEFAULT_TIMEOUT, mcp.read_response(trust_id)).await??;
+    if initially_approved {
+        let trust_id = mcp
+            .send_config_batch_write_request(ConfigBatchWriteParams {
+                edits: vec![ConfigEdit {
+                    key_path: "hooks.state".to_string(),
+                    value: serde_json::Value::Object(trusted_hooks),
+                    merge_strategy: MergeStrategy::Upsert,
+                }],
+                file_path: None,
+                expected_version: None,
+                reload_user_config: true,
+            })
+            .await?;
+        let _: codex_app_server_protocol::ConfigWriteResponse =
+            timeout(DEFAULT_TIMEOUT, mcp.read_response(trust_id)).await??;
+    }
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
@@ -628,16 +647,24 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()
     let ThreadStartResponse { thread, .. } =
         timeout(DEFAULT_TIMEOUT, mcp.read_response(start_id)).await??;
 
+    // A second process saves approvals; it cannot reload the first process's thread.
+    let mut approver = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
     let mut expected_versions = String::new();
-    for (version, expected_trust) in [
-        ("1.0.0", HookTrustStatus::Trusted),
-        ("2.0.0", HookTrustStatus::Modified),
-        ("2.0.0", HookTrustStatus::Trusted),
-        ("0.9.0", HookTrustStatus::Modified),
-        ("0.9.0", HookTrustStatus::Trusted),
-    ] {
+    for (version, script_changed, expected_trust) in versions {
         // This test process updates the shared store without notifying app-server.
         write_versioned_plugin_hook(source.path(), version, &hook_log_path)?;
+        if script_changed {
+            let script = source.path().join("hooks/log_version.py");
+            let contents = std::fs::read_to_string(&script)?;
+            std::fs::write(
+                script,
+                format!("{contents}\n# reviewed same-version update\n"),
+            )?;
+        }
         store.install(AbsolutePathBuf::try_from(source.path())?, plugin_id.clone())?;
         let turn_id = mcp
             .send_turn_start_request(TurnStartParams {
@@ -650,6 +677,19 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()
             })
             .await?;
         let _: TurnStartResponse = timeout(DEFAULT_TIMEOUT, mcp.read_response(turn_id)).await??;
+        if expected_trust != HookTrustStatus::Untrusted {
+            let completed: HookCompletedNotification =
+                timeout(DEFAULT_TIMEOUT, mcp.read_notification("hook/completed")).await??;
+            assert_eq!(completed.run.event_name, HookEventName::UserPromptSubmit);
+            if expected_trust == HookTrustStatus::Modified {
+                assert!(
+                    completed.run.entries.iter().any(|entry| {
+                        entry.text == "plugin contents changed; hook approval required"
+                    }),
+                    "unexpected hook result: {completed:?}"
+                );
+            }
+        }
         timeout(
             DEFAULT_TIMEOUT,
             mcp.read_stream_until_notification_message("turn/completed"),
@@ -658,7 +698,10 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()
         if expected_trust == HookTrustStatus::Trusted {
             expected_versions.push_str(&format!("{version}\n"));
         }
-        assert_eq!(std::fs::read_to_string(&hook_log_path)?, expected_versions);
+        assert_eq!(
+            std::fs::read_to_string(&hook_log_path).unwrap_or_default(),
+            expected_versions
+        );
         let list_id = mcp
             .send_hooks_list_request(HooksListParams {
                 cwds: vec![codex_home.path().to_path_buf()],
@@ -700,23 +743,160 @@ async fn loaded_session_refreshes_externally_updated_plugin_hooks() -> Result<()
                 },
             );
         }
-        if expected_trust == HookTrustStatus::Modified {
-            let trust_id = mcp
+        if expected_trust != HookTrustStatus::Trusted {
+            let trust_id = approver
                 .send_config_batch_write_request(ConfigBatchWriteParams {
-                    edits: vec![ConfigEdit {
-                        key_path: format!("hooks.state.\"{}\".trusted_hash", hook.key),
-                        value: serde_json::json!(hook.current_hash),
-                        merge_strategy: MergeStrategy::Upsert,
-                    }],
+                    edits: data[0]
+                        .hooks
+                        .iter()
+                        .map(|hook| ConfigEdit {
+                            key_path: format!("hooks.state.\"{}\".trusted_hash", hook.key),
+                            value: serde_json::json!(hook.current_hash),
+                            merge_strategy: MergeStrategy::Upsert,
+                        })
+                        .collect(),
                     file_path: None,
                     expected_version: None,
                     reload_user_config: true,
                 })
                 .await?;
             let _: codex_app_server_protocol::ConfigWriteResponse =
-                timeout(DEFAULT_TIMEOUT, mcp.read_response(trust_id)).await??;
+                timeout(DEFAULT_TIMEOUT, approver.read_response(trust_id)).await??;
         }
     }
+
+    // Resume the same loaded thread in A after B's approval.
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse = timeout(DEFAULT_TIMEOUT, mcp.read_response(resume_id)).await??;
+    let id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "resumed".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = timeout(DEFAULT_TIMEOUT, mcp.read_response(id)).await??;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    expected_versions.push_str("0.9.0\n");
+    assert_eq!(std::fs::read_to_string(&hook_log_path)?, expected_versions);
+
+    let config_path = codex_home.path().join("config.toml");
+    let approved_config = std::fs::read_to_string(&config_path)?;
+    for denial in [
+        "revoke",
+        "disable",
+        "plugin",
+        "feature",
+        "malformed",
+        "delete",
+    ] {
+        std::fs::write(&config_path, &approved_config)?;
+        // Each denial starts from an admitted runtime, rather than inheriting the
+        // previous case's empty handler set.
+        let id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: format!("approved baseline before {denial}"),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let _: TurnStartResponse = timeout(DEFAULT_TIMEOUT, mcp.read_response(id)).await??;
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        expected_versions.push_str("0.9.0\n");
+        assert_eq!(std::fs::read_to_string(&hook_log_path)?, expected_versions);
+        if denial == "delete" {
+            std::fs::remove_file(&config_path)?;
+        } else if denial == "malformed" {
+            std::fs::write(&config_path, "[hooks.state")?;
+        } else {
+            let edit = match denial {
+                "revoke" => ConfigEdit {
+                    key_path: "hooks.state".to_string(),
+                    value: serde_json::json!({}),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                "disable" => ConfigEdit {
+                    key_path: "hooks.state".to_string(),
+                    value: serde_json::json!({
+                        "demo@test:hooks/hooks.json:user_prompt_submit:0:0": {"enabled": false},
+                        "demo@test:hooks/hooks.json:session_end:0:0": {"enabled": false},
+                    }),
+                    merge_strategy: MergeStrategy::Upsert,
+                },
+                "feature" => ConfigEdit {
+                    key_path: "features.plugins".to_string(),
+                    value: serde_json::json!(false),
+                    merge_strategy: MergeStrategy::Upsert,
+                },
+                _ => ConfigEdit {
+                    key_path: "plugins.\"demo@test\".enabled".to_string(),
+                    value: serde_json::json!(false),
+                    merge_strategy: MergeStrategy::Upsert,
+                },
+            };
+            let id = approver
+                .send_config_batch_write_request(ConfigBatchWriteParams {
+                    edits: vec![edit],
+                    file_path: None,
+                    expected_version: None,
+                    reload_user_config: true,
+                })
+                .await?;
+            let _: codex_app_server_protocol::ConfigWriteResponse =
+                timeout(DEFAULT_TIMEOUT, approver.read_response(id)).await??;
+        }
+        let id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: format!("denial: {denial}"),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let _: TurnStartResponse = timeout(DEFAULT_TIMEOUT, mcp.read_response(id)).await??;
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        assert_eq!(
+            std::fs::read_to_string(&hook_log_path)?,
+            expected_versions,
+            "{denial}"
+        );
+    }
+    // SessionEnd must refresh even though deletion left its preview empty.
+    std::fs::write(&config_path, approved_config)?;
+    let archive_id = mcp
+        .send_thread_archive_request(ThreadArchiveParams {
+            thread_id: thread.id,
+        })
+        .await?;
+    let _: ThreadArchiveResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(archive_id)).await??;
+    expected_versions.push_str("0.9.0\n");
+    assert_eq!(std::fs::read_to_string(&hook_log_path)?, expected_versions);
     Ok(())
 }
 

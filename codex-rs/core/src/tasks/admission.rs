@@ -105,6 +105,7 @@ impl Session {
             return Ok(());
         }
 
+        self.refresh_hook_admission().await;
         for item in recordable_inputs(self, &model_info, &input) {
             let item = item?;
             // The user must resubmit a prompt that still needs a submit hook.
