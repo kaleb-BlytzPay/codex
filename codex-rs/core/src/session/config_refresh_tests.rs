@@ -200,6 +200,28 @@ async fn hook_refresh_retries_current_plugin_policy_after_owner_replacement() ->
     // Finishing a hook rebuild from the previous allow policy must not restore it.
     session.refresh_hooks(initial).await;
     assert!(session.hooks().preview_session_start(&request).is_empty());
+
+    // A previously loaded allow must not outweigh a newly saved default denial.
+    std::fs::write(
+        &file,
+        format!("{user_config}[plugins._default]\nenabled = true\n"),
+    )?;
+    let mut allowed = load_latest_config_for_session(&session).await;
+    allowed.bypass_hook_trust = true;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(allowed);
+    session.refresh_hook_admission().await;
+    assert_eq!(session.hooks().preview_session_start(&request).len(), 1);
+    std::fs::write(
+        &file,
+        format!("{user_config}[plugins._default]\nenabled = false\n"),
+    )?;
+    session.refresh_hook_admission().await;
+    assert!(session.hooks().preview_session_start(&request).is_empty());
     Ok(())
 }
 

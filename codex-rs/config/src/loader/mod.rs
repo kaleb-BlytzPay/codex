@@ -504,7 +504,8 @@ pub async fn load_config_layers_state(
             .with_applied_config_server(applied_config_server)
             .with_user_and_project_exec_policy_rules_ignored(
                 ignore_user_and_project_exec_policy_rules,
-            );
+            )
+            .with_user_config_ignored(ignore_user_config);
     config_layer_stack.is_projectless = is_projectless;
     if config_layer_stack.layers_low_to_high().any(|layer| {
         matches!(

@@ -5921,7 +5921,10 @@ impl Session {
 
     /// Refresh before selecting or previewing handlers, including an empty runtime.
     pub(crate) async fn refresh_hook_admission(&self) {
-        self.refresh_hooks(self.get_config().await).await;
+        let config = self.get_config().await;
+        if config.features.enabled(Feature::CodexHooks) {
+            self.refresh_hooks(config).await;
+        }
     }
 
     pub(crate) fn hooks(&self) -> Arc<Hooks> {
@@ -6055,6 +6058,11 @@ impl Default for HookRefresh {
 
 /// Shared by the explicit runtime reload and the hook-only admission projection.
 async fn reload_user_layers(config: &Config) -> std::io::Result<codex_config::ConfigLayerStack> {
+    // Startup still records the user path. The table is empty both when the file was
+    // ignored and when it was missing, so only the flag can keep a later read closed.
+    if config.config_layer_stack.ignore_user_config() {
+        return Ok(config.config_layer_stack.clone());
+    }
     let mut paths = config
         .config_layer_stack
         .all_layers_low_to_high()
@@ -6087,10 +6095,11 @@ async fn reload_user_layers(config: &Config) -> std::io::Result<codex_config::Co
 
 async fn hook_config_from_user_layers(config: &Config) -> std::io::Result<Config> {
     let layers = reload_user_layers(config).await?;
-    // Malformed hooks or plugins toml fails closed. Plugin enablement stays on the
-    // session config: a saved user layer must not restore a plugin the session denied.
-    // Per-plugin disk disables still ride along on the reloaded stack.
-    for layer in layers.all_layers_low_to_high() {
+    // Malformed hooks or plugins on an enabled layer fail closed. A disabled layer is
+    // not an override: effective config and discovery already skip it. Plugin enablement
+    // stays on the session config: a saved user layer must not restore a plugin the
+    // session denied. Per-plugin disk disables still ride along on the reloaded stack.
+    for layer in layers.layers_low_to_high() {
         if let Some(hooks) = layer.config.get("hooks") {
             hooks
                 .clone()
@@ -6106,9 +6115,13 @@ async fn hook_config_from_user_layers(config: &Config) -> std::io::Result<Config
     }
     let mut refreshed = config.clone();
     let effective = layers.effective_config();
-    // A persisted default deny applies only when this session has not published one.
-    // An in-memory deny must survive a disk user layer that still allows the plugin.
-    if refreshed.plugins.default.is_none() {
+    // Either authority can deny; a saved allow cannot relax a published session deny.
+    if refreshed
+        .plugins
+        .default
+        .as_ref()
+        .is_none_or(|default| default.enabled)
+    {
         let disk_plugins: codex_config::types::PluginsConfigToml = effective
             .get("plugins")
             .cloned()
@@ -6160,7 +6173,8 @@ fn managed_only_hook_config(config: &Config) -> Config {
         stack.all_layers_low_to_high().cloned().collect(),
         requirements,
         stack.requirements_toml().clone(),
-    ) else {
+    )
+    .map(|layers| layers.with_user_config_ignored(stack.ignore_user_config())) else {
         // The constructor validates layer ordering, shell policy and project/provider
         // requirements. All are copied unchanged from an already validated stack.
         unreachable!("managed-only hook admission cannot invalidate existing config layers");

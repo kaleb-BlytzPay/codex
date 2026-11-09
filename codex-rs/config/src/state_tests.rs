@@ -396,3 +396,58 @@ fn with_user_config_updates_matching_user_layer_without_replacing_active_profile
         Some("on-request")
     );
 }
+
+#[test]
+fn ignored_user_config_provenance_follows_user_layers() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let user_file = test_user_config_path(&temp_dir, "config.toml");
+    let empty = ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: user_file.clone(),
+            profile: None,
+        },
+        TomlValue::Table(toml::map::Map::new()),
+    );
+    assert!(empty.disabled_reason.is_none());
+    let ignored = ConfigLayerStack::new(
+        vec![empty],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("empty user layer")
+    .with_user_config_ignored(true);
+    let replaced = ignored
+        .with_user_config(
+            &user_file,
+            toml::from_str("model = \"edited\"").expect("edited user config"),
+        )
+        .expect("replace ignored user layer")
+        .with_session_config(TomlValue::Table(toml::map::Map::new()))
+        .expect("session layer");
+    assert!(replaced.ignore_user_config());
+    assert!(
+        replaced
+            .get_active_user_layer()
+            .expect("user layer")
+            .disabled_reason
+            .is_none()
+    );
+
+    let ordinary = ConfigLayerStack::new(
+        Vec::new(),
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("empty stack");
+    assert!(!ordinary.ignore_user_config());
+    assert!(
+        ordinary
+            .with_user_layer_from(&replaced)
+            .ignore_user_config()
+    );
+    assert!(
+        !replaced
+            .with_user_layer_from(&ordinary)
+            .ignore_user_config()
+    );
+}

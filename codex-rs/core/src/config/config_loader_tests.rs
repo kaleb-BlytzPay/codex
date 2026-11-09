@@ -228,6 +228,9 @@ invalid = ["#,
         TomlValue::Table(toml::map::Map::new()),
         "expected ignored user config to preserve only layer metadata"
     );
+    assert!(user_layer.disabled_reason.is_none());
+    assert!(user_layer.as_layer().disabled_reason.is_none());
+    assert!(layers.ignore_user_config());
     assert_eq!(layers.effective_config().get("model"), None);
     Ok(())
 }

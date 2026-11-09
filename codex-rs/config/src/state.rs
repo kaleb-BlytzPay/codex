@@ -271,6 +271,11 @@ pub struct ConfigLayerStack {
     /// Whether execpolicy should skip `.rules` files from user and project config-layer folders.
     ignore_user_and_project_exec_policy_rules: bool,
 
+    /// The loader did not read user config files. Later reloads must not read them either.
+    /// The user layer stays present and empty so its path still shows up; an empty table is
+    /// also what a missing file looks like, so this flag is the only ignore signal.
+    ignore_user_config: bool,
+
     /// Startup warnings discovered while building this stack.
     ///
     /// `None` means the loader did not check for stack-level warnings, while
@@ -290,6 +295,7 @@ impl PartialEq for ConfigLayerStack {
             requirements,
             requirements_toml,
             ignore_user_and_project_exec_policy_rules,
+            ignore_user_config,
             startup_warnings,
             is_projectless,
         } = self;
@@ -300,6 +306,7 @@ impl PartialEq for ConfigLayerStack {
             && requirements_toml == &other.requirements_toml
             && *ignore_user_and_project_exec_policy_rules
                 == other.ignore_user_and_project_exec_policy_rules
+            && *ignore_user_config == other.ignore_user_config
             && startup_warnings == &other.startup_warnings
             && is_projectless == &other.is_projectless
     }
@@ -325,6 +332,7 @@ impl ConfigLayerStack {
             requirements,
             requirements_toml: Box::new(requirements_toml),
             ignore_user_and_project_exec_policy_rules: false,
+            ignore_user_config: false,
             startup_warnings: None,
             is_projectless: false,
         };
@@ -364,6 +372,16 @@ impl ConfigLayerStack {
 
     pub fn ignore_user_and_project_exec_policy_rules(&self) -> bool {
         self.ignore_user_and_project_exec_policy_rules
+    }
+
+    pub fn with_user_config_ignored(mut self, ignore_user_config: bool) -> Self {
+        self.ignore_user_config = ignore_user_config;
+        self
+    }
+
+    /// Whether startup skipped `$CODEX_HOME` user config files.
+    pub fn ignore_user_config(&self) -> bool {
+        self.ignore_user_config
     }
 
     pub fn with_cloud_config_binding(
@@ -548,6 +566,7 @@ impl ConfigLayerStack {
             requirements_toml: self.requirements_toml.clone(),
             ignore_user_and_project_exec_policy_rules: self
                 .ignore_user_and_project_exec_policy_rules,
+            ignore_user_config: self.ignore_user_config,
             startup_warnings: self.startup_warnings.clone(),
             is_projectless: self.is_projectless,
         })
@@ -632,6 +651,8 @@ impl ConfigLayerStack {
             requirements_toml: self.requirements_toml.clone(),
             ignore_user_and_project_exec_policy_rules: self
                 .ignore_user_and_project_exec_policy_rules,
+            // User layers came from `other`, so the ignore bit has to come from there too.
+            ignore_user_config: other.ignore_user_config,
             startup_warnings: self.startup_warnings.clone(),
             is_projectless: self.is_projectless,
         }

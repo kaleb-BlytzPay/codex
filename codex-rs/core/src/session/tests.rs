@@ -101,6 +101,7 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnEnvironmentSelections;
@@ -2187,6 +2188,241 @@ async fn hook_admission_refresh_fails_closed_without_removing_managed_hooks(
     );
     if denial != "managed_only" {
         assert!(Arc::ptr_eq(&config, &session.get_config().await));
+    }
+    Ok(())
+}
+
+fn hook_sources(session: &Session, request: &codex_hooks::SessionStartRequest) -> Vec<HookSource> {
+    session
+        .hooks()
+        .preview_session_start(request)
+        .into_iter()
+        .map(|run| run.source)
+        .collect()
+}
+
+#[tokio::test]
+async fn ignored_user_config_never_grants_hooks_plugins_or_trust() -> anyhow::Result<()> {
+    let (session, request, mut trusted) = hook_refresh_test_session().await?;
+    let home = session.codex_home().await;
+    let source = tempfile::tempdir()?;
+    std::fs::create_dir_all(source.path().join(".codex-plugin"))?;
+    std::fs::write(
+        source.path().join(".codex-plugin/plugin.json"),
+        r#"{"name":"sample","hooks":{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo sample"}]}]}}}"#,
+    )?;
+    codex_core_plugins::store::PluginStore::new(home.to_path_buf()).install(
+        AbsolutePathBuf::try_from(source.path().to_path_buf())?,
+        codex_plugin::PluginId::parse("sample@test")?,
+    )?;
+    let table = trusted.as_table_mut().expect("user config table");
+    table.insert(
+        "model".to_string(),
+        toml::Value::String("from-ignored-user".to_string()),
+    );
+    table.insert(
+        "features".to_string(),
+        toml::Value::Table(toml::map::Map::from_iter([
+            ("hooks".to_string(), toml::Value::Boolean(true)),
+            ("plugins".to_string(), toml::Value::Boolean(true)),
+        ])),
+    );
+    table.insert(
+        "plugins".to_string(),
+        toml::Value::Table(toml::map::Map::from_iter([(
+            "sample@test".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        )])),
+    );
+    let base = home.join(CONFIG_TOML_FILE);
+    let profile = home.join("work.config.toml");
+    std::fs::write(&base, toml::to_string(&trusted)?)?;
+    let mut profile_config = trusted.clone();
+    profile_config["model"] = toml::Value::String("from-ignored-profile".to_string());
+    std::fs::write(&profile, toml::to_string(&profile_config)?)?;
+
+    let mut granting = (*session.get_config().await).clone();
+    granting
+        .features
+        .enable(Feature::Plugins)
+        .expect("enable plugins");
+    granting.bypass_hook_trust = true;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(granting);
+    session.refresh_hook_admission().await;
+    let granted = hook_sources(&session, &request);
+    assert!(granted.contains(&HookSource::User), "{granted:?}");
+    assert!(granted.contains(&HookSource::Plugin), "{granted:?}");
+
+    let mut ignored = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(home.to_path_buf())
+        .loader_overrides(LoaderOverrides {
+            ignore_user_config: true,
+            user_config_path: Some(profile.abs()),
+            user_config_profile: Some("work".parse()?),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await?;
+    assert!(ignored.config_layer_stack.ignore_user_config());
+    let user_layers = ignored
+        .config_layer_stack
+        .all_layers_low_to_high()
+        .filter(|layer| matches!(layer.name, codex_config::ConfigLayerSource::User { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(user_layers.len(), 2);
+    assert!(user_layers.iter().all(|layer| {
+        layer.disabled_reason.is_none()
+            && layer
+                .config
+                .as_table()
+                .is_some_and(toml::map::Map::is_empty)
+    }));
+    ignored
+        .features
+        .enable(Feature::CodexHooks)
+        .expect("enable hooks despite ignored user config");
+    ignored
+        .features
+        .enable(Feature::Plugins)
+        .expect("enable plugins despite ignored user config");
+    ignored.bypass_hook_trust = true;
+    let managed: codex_config::ManagedHooksRequirementsToml =
+        serde_json::from_value(serde_json::json!({
+            "SessionStart": [{"hooks": [{"type": "command", "command": "echo required-managed"}]}]
+        }))?;
+    let mut requirements = ignored.config_layer_stack.requirements().clone();
+    requirements.managed_hooks = Some(codex_config::ConstrainedWithSource::new(
+        codex_config::Constrained::allow_any(managed),
+        Some(codex_config::RequirementSource::Unknown),
+    ));
+    ignored.config_layer_stack = ConfigLayerStack::new(
+        ignored
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect(),
+        requirements,
+        ignored.config_layer_stack.requirements_toml().clone(),
+    )?
+    .with_user_config_ignored(true);
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(ignored);
+    session.refresh_hook_admission().await;
+    assert_eq!(hook_sources(&session, &request), vec![HookSource::Unknown]);
+
+    session.reload_user_config_layer().await;
+    let config = session.get_config().await;
+    assert!(config.config_layer_stack.ignore_user_config());
+    assert_eq!(
+        config.config_layer_stack.effective_config().get("model"),
+        None
+    );
+    assert!(
+        config
+            .config_layer_stack
+            .effective_config()
+            .get("hooks")
+            .is_none()
+    );
+    assert!(
+        config
+            .config_layer_stack
+            .effective_config()
+            .get("plugins")
+            .is_none()
+    );
+    assert!(
+        config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .all(|layer| {
+                !matches!(layer.name, codex_config::ConfigLayerSource::User { .. })
+                    || layer
+                        .config
+                        .as_table()
+                        .is_some_and(toml::map::Map::is_empty)
+            })
+    );
+    assert_eq!(hook_sources(&session, &request), vec![HookSource::Unknown]);
+    Ok(())
+}
+
+#[test_case(true; "disabled untrusted project")]
+#[test_case(false; "enabled project override")]
+#[tokio::test]
+async fn disabled_project_malformed_hooks_do_not_block_approved_user_hooks(
+    disabled: bool,
+) -> anyhow::Result<()> {
+    let (session, request, _) = hook_refresh_test_session().await?;
+    let mut config = (*session.get_config().await).clone();
+    let malformed: toml::Value =
+        toml::from_str("[hooks]\nSessionStart = \"echo hi\"\n\n[plugins]\nenabled = true\n")?;
+    let requirements = config.config_layer_stack.requirements().clone();
+    let requirements_toml = config.config_layer_stack.requirements_toml().clone();
+    let mut layers = config
+        .config_layer_stack
+        .all_layers_low_to_high()
+        .cloned()
+        .collect::<Vec<_>>();
+    let project_name = layers
+        .iter()
+        .find(|layer| matches!(layer.name, codex_config::ConfigLayerSource::Project { .. }))
+        .map(|layer| layer.name.clone());
+    let _project_dir = if project_name.is_none() {
+        let project = tempfile::tempdir()?;
+        let dot_codex = project.path().join(".codex");
+        std::fs::create_dir_all(&dot_codex)?;
+        Some((
+            project,
+            codex_config::ConfigLayerSource::Project {
+                dot_codex_folder: AbsolutePathBuf::try_from(dot_codex)?,
+            },
+        ))
+    } else {
+        None
+    };
+    let project_name = project_name.or_else(|| _project_dir.as_ref().map(|(_, name)| name.clone()));
+    let project_name = project_name.expect("project layer");
+    let project_layer = if disabled {
+        codex_config::ConfigLayerEntry::new_disabled(
+            project_name.clone(),
+            malformed,
+            "project is not trusted",
+        )
+    } else {
+        codex_config::ConfigLayerEntry::new(project_name.clone(), malformed)
+    };
+    if let Some(index) = layers.iter().position(|layer| layer.name == project_name) {
+        layers[index] = project_layer;
+    } else {
+        let index = layers
+            .iter()
+            .position(|layer| layer.name.precedence() > project_layer.name.precedence())
+            .unwrap_or(layers.len());
+        layers.insert(index, project_layer);
+    }
+    config.config_layer_stack = ConfigLayerStack::new(layers, requirements, requirements_toml)?;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(config);
+    session.refresh_hook_admission().await;
+    let sources = hook_sources(&session, &request);
+    if disabled {
+        assert_eq!(sources, vec![HookSource::User], "{sources:?}");
+    } else {
+        assert!(sources.is_empty(), "{sources:?}");
     }
     Ok(())
 }

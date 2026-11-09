@@ -2959,9 +2959,11 @@ async fn try_run_sampling_request(
                 });
                 // The response wait may outlive an approval, revocation, or policy change.
                 let hooks = hooks_for_model_request(&session, &step).await;
-                let _ =
-                    admitted.send(hooks.execution_mode_for_event(HookEventName::PostModelRequest));
-                run_model_request_hooks(&session, &step, &hooks, event).await;
+                let mode = hooks.execution_mode_for_event(HookEventName::PostModelRequest);
+                let _ = admitted.send(mode);
+                if mode.is_some() {
+                    run_model_request_hooks(&session, &step, &hooks, event).await;
+                }
                 let _ = hook_done.send(());
             }
         });
