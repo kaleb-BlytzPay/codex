@@ -370,6 +370,11 @@ impl Hooks {
         self.engine.command_runtime.schedule_async_task(task);
     }
 
+    /// Track session bookkeeping until shutdown without consuming an async-hook permit.
+    pub fn schedule_session_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.engine.command_runtime.schedule_session_task(task);
+    }
+
     pub fn preview_model_request(
         &self,
         request: &crate::ModelRequestHookInput,

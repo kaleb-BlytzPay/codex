@@ -2937,14 +2937,18 @@ async fn try_run_sampling_request(
     let effort = sess
         .reasoning_effort_for_request(&step_context.settings, super::RequestEffortUsage::Sampling)
         .await;
-    let hooks = hooks_for_model_request(&sess, &step_context);
+    let hooks = hooks_for_model_request(&sess, &step_context).await;
     let post_mode = hooks.execution_mode_for_event(HookEventName::PostModelRequest);
     let defer_tool_dispatch = post_mode == Some(HookExecutionMode::Sync);
-    let finish_post_request = post_mode.map(|_| {
+    // Always admit the post hook at completion, even when no handler was approved at
+    // request start. Tool calls already dispatched retain their admission snapshot.
+    // This wait is session bookkeeping: it must not take an async-hook permit, or a
+    // saturated background queue stalls hook-free completion for the whole response.
+    let finish_post_request = Some({
         let (post_request, completed) = tokio::sync::oneshot::channel();
+        let (admitted, wait_for_admission) = tokio::sync::oneshot::channel();
         let (hook_done, wait_for_hook) = tokio::sync::oneshot::channel();
-        hooks.schedule_async_task({
-            let hooks = Arc::clone(&hooks);
+        hooks.schedule_session_task({
             let session = Arc::clone(&sess);
             let step = Arc::clone(&step_context);
             async move {
@@ -2953,14 +2957,23 @@ async fn try_run_sampling_request(
                     error: None,
                     token_usage: None,
                 });
-                run_model_request_hooks(&session, &step, &hooks, event).await;
+                // The response wait may outlive an approval, revocation, or policy change.
+                let hooks = hooks_for_model_request(&session, &step).await;
+                let mode = hooks.execution_mode_for_event(HookEventName::PostModelRequest);
+                let _ = admitted.send(mode);
+                if mode.is_some() {
+                    run_model_request_hooks(&session, &step, &hooks, event).await;
+                }
                 let _ = hook_done.send(());
             }
         });
         let cancellation_token = cancellation_token.clone();
         async move |event| {
             let _ = post_request.send(event);
-            if defer_tool_dispatch {
+            if matches!(
+                wait_for_admission.or_cancel(&cancellation_token).await,
+                Ok(Ok(Some(HookExecutionMode::Sync)))
+            ) {
                 // Interrupt the wait, not the session-owned hook or final token accounting.
                 let _ = wait_for_hook.or_cancel(&cancellation_token).await;
             }

@@ -165,6 +165,7 @@ pub(crate) async fn run_pending_session_start_hooks(
             permission_mode: hook_permission_mode(turn_context.approval_policy()),
             target,
         };
+        sess.refresh_hook_admission().await;
         let hooks = with_environment_hooks(
             sess,
             turn_context,
@@ -217,6 +218,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
         tool_use_id,
         tool_input: tool_input.clone(),
     };
+    sess.refresh_hook_admission().await;
     let hooks = with_tool_environment_hooks(
         sess,
         turn_context,
@@ -293,6 +295,7 @@ pub(crate) async fn run_permission_request_hooks(
         run_id_suffix: run_id_suffix.to_string(),
         tool_input: payload.tool_input,
     };
+    sess.refresh_hook_admission().await;
     let hooks = with_tool_environment_hooks(
         sess,
         turn_context,
@@ -338,6 +341,7 @@ pub(crate) async fn run_post_tool_use_hooks(
         tool_input: payload.tool_input,
         tool_response: payload.tool_response,
     };
+    sess.refresh_hook_admission().await;
     let hooks = with_tool_environment_hooks(
         sess,
         turn_context,
@@ -442,6 +446,7 @@ pub(crate) async fn run_turn_stop_hooks(
         target,
     };
     let executor_hook_sources = step_context.executor_hook_sources.clone();
+    sess.refresh_hook_admission().await;
     let hooks = with_environment_hooks(sess, turn_context, &step_context.environments)
         .with_executor_hooks(executor_hook_sources);
     emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
@@ -453,6 +458,7 @@ pub(crate) async fn run_turn_stop_hooks(
 
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
+    sess.refresh_hook_admission().await;
     // Building a turn can read plugins and skills from a remote executor. Check
     // the captured hook declarations before spending any of the shutdown deadline.
     let environments = sess.services.turn_environments.snapshot_now();
@@ -512,6 +518,7 @@ pub(crate) async fn run_turn_interrupt_hooks(
         .map(|step| step.executor_hook_sources.clone())
         .unwrap_or_default();
     let has_executor_hooks = !executor_hook_sources.is_empty();
+    sess.refresh_hook_admission().await;
     let hooks = last_known_step_context
         .as_deref()
         .map_or_else(
@@ -559,6 +566,7 @@ pub(crate) async fn run_pre_compact_hooks(
         model: turn_context.model_info().slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
     };
+    sess.refresh_hook_admission().await;
     let hooks = with_environment_hooks(
         sess,
         turn_context,
@@ -601,6 +609,7 @@ pub(crate) async fn run_post_compact_hooks(
         model: turn_context.model_info().slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
     };
+    sess.refresh_hook_admission().await;
     let hooks = with_environment_hooks(
         sess,
         turn_context,
@@ -650,6 +659,7 @@ pub(crate) async fn run_legacy_after_agent_hook(
     last_assistant_message: Option<String>,
 ) -> bool {
     let mut abort_message = None;
+    sess.refresh_hook_admission().await;
     let hooks = sess.hooks();
     for hook_outcome in hooks
         .dispatch(codex_hooks::HookPayload {
@@ -723,6 +733,7 @@ pub(crate) async fn inspect_pending_input(
                 permission_mode: hook_permission_mode(turn_context.approval_policy()),
                 prompt: UserMessageItem::new(content).message(),
             };
+            sess.refresh_hook_admission().await;
             let hooks = with_environment_hooks(
                 sess,
                 turn_context,
@@ -1111,10 +1122,11 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
     }
 }
 
-pub(crate) fn hooks_for_model_request(
+pub(crate) async fn hooks_for_model_request(
     session: &Arc<Session>,
     step: &StepContext,
 ) -> Arc<codex_hooks::Hooks> {
+    session.refresh_hook_admission().await;
     match step.turn.session_source {
         SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
         | SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => Arc::new(

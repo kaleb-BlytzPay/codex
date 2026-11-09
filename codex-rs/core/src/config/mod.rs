@@ -2121,7 +2121,8 @@ impl Config {
         .with_applied_config_server(refreshed_layers.applied_config_server().cloned())
         .with_user_and_project_exec_policy_rules_ignored(
             refreshed_layers.ignore_user_and_project_exec_policy_rules(),
-        ))
+        )
+        .with_user_config_ignored(refreshed_layers.ignore_user_config()))
     }
 
     /// This is the preferred way to create an instance of [Config].

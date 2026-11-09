@@ -63,6 +63,15 @@ pub fn trusted_config_layer_stack(
         state_table.insert(hook.key, hook_state);
     }
 
+    // Hook admission reloads persisted approval state, just like another process's writes.
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        user_config
+            .as_table()
+            .expect("trusted hook fixture table")
+            .to_string(),
+    )
+    .expect("persist trusted hook fixture");
     config_layer_stack
         .with_user_config(&codex_home.join(CONFIG_TOML_FILE), user_config)
         .expect("hook user config should be valid")
